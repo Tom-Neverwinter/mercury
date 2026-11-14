@@ -36,7 +36,9 @@ PROJECT_INC = -I../../common -I../../modem -I../../datalink_arq \
               -I../../gui_interface/websocket
 
 # Populated by later tasks.
-FUZZ_BINS = fuzz_arq_hdr fuzz_frame_header fuzz_kiss fuzz_arith fuzz_ws_json
+FUZZ_BINS = fuzz_arq_hdr fuzz_frame_header fuzz_kiss fuzz_arith fuzz_ws_json \
+            fuzz_tnc_ctl fuzz_arq_rx fuzz_carousel fuzz_bcast_file fuzz_cfg \
+            fuzz_hl2 fuzz_msg_store
 
 # Number of iterations for the smoke `check` run (kept short: this is a
 # build+no-crash gate, not a fuzzing campaign).
@@ -96,4 +98,44 @@ fuzz_arith: fuzz_arith.c ../../datalink_arq/arith.c
 
 # Reachable by anything that can open the UI port, which is unauthenticated.
 fuzz_ws_json: fuzz_ws_json.c ../../gui_interface/websocket/ws_json.c
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -o $@ $^ $(FUZZ_LDFLAGS)
+
+# The TNC control port's command parser.  The harness #includes
+# tcp_interfaces.c (its parser is static), so the .c is a prerequisite only.
+fuzz_tnc_ctl: fuzz_tnc_ctl.c ../../data_interfaces/tcp_interfaces.c \
+              ../../modem/framer.c ../../datalink_arq/arq_tnc.c \
+              ../../common/shm_posix.c ../../common/os_interop.c \
+              ../../common/mercury_modes.c
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -o $@ \
+	    $(filter-out %/tcp_interfaces.c,$^) $(FUZZ_LDFLAGS)
+
+# The ARQ receive path: FSM + carousel, on the virtual clock.
+ARQ_CORE = ../datalink_arq/arq_test_stubs.c ../../datalink_arq/carousel.c \
+           ../../datalink_arq/rs_erasure.c ../../datalink_arq/arq_protocol.c \
+           ../../datalink_arq/arith.c ../../common/virtual_clock.c
+fuzz_arq_rx: fuzz_arq_rx.c $(ARQ_CORE) ../../datalink_arq/arq_fsm.c \
+             ../../datalink_arq/arq_timing.c
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -o $@ $^ $(FUZZ_LDFLAGS)
+
+fuzz_carousel: fuzz_carousel.c $(ARQ_CORE)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -o $@ $^ $(FUZZ_LDFLAGS)
+
+RAPTORQ_SRC = $(wildcard ../../datalink_broadcast/raptorq/lib/*.c) \
+              $(wildcard ../../datalink_broadcast/raptorq/deps/obl/*.c)
+fuzz_bcast_file: fuzz_bcast_file.c ../../datalink_broadcast/bcast_file.c $(RAPTORQ_SRC)
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) \
+	    -I../../datalink_broadcast/raptorq/include -I../../datalink_broadcast/raptorq/deps \
+	    -o $@ $^ $(FUZZ_LDFLAGS)
+
+fuzz_cfg: fuzz_cfg.c ../../common/cfg_utils.c ../../radio_io/cm108_ptt.c \
+          ../../common/hermes_log.c ../../common/iniparser/iniparser.c \
+          ../../common/iniparser/dictionary.c
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -I../../common/iniparser -I../../audioio \
+	    -o $@ $^ $(FUZZ_LDFLAGS)
+
+# Reachable by anything on the radio's LAN segment.
+fuzz_hl2: fuzz_hl2.c ../../audioio/hl2_dsp.c
+	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -I../../audioio -o $@ $^ $(FUZZ_LDFLAGS)
+
+fuzz_msg_store: fuzz_msg_store.c ../../common/message_store.c ../../common/hermes_log.c
 	$(FUZZ_CC) $(FUZZ_CFLAGS) $(PROJECT_INC) -o $@ $^ $(FUZZ_LDFLAGS)

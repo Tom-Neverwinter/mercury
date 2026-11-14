@@ -13,6 +13,16 @@ not part of the blocking CI gates and require clang with libFuzzer.
 | `fuzz_kiss` | KISS frames off the TCP link |
 | `fuzz_arith` | the arithmetic coder |
 | `fuzz_ws_json` | UI commands off the WebSocket port (unauthenticated) |
+| `fuzz_tnc_ctl` | TNC control-port command lines (`process_control_bytes`), split across reads |
+| `fuzz_arq_rx` | the ARQ receive path: CALL/ACCEPT parsers, DISCONNECT, session frames through the FSM into the carousel, in every connection state |
+| `fuzz_carousel` | the carousel data plane (`car_on_frame` and its timers) as caller or callee |
+| `fuzz_bcast_file` | broadcast file frames (RaptorQ); checks nothing is written outside the download dir |
+| `fuzz_cfg` | the INI config (`cfg_read`/`cfg_write`); `FUZZ_CFG_ROUNDTRIP=1` also asserts the round trip |
+| `fuzz_hl2` | Hermes Lite 2 UDP discovery replies and EP6 packets, on into the RX DSP |
+| `fuzz_msg_store` | the persisted message store (JSONL) load, trim and rewrite |
+
+`fuzz_arq_hdr` and `fuzz_frame_header` are shallow (a length check and a byte
+or two); `fuzz_arq_rx` is the one that reaches what a received frame does.
 
 ## Build
 
@@ -47,20 +57,8 @@ drops a `crash-<sha1>` / `leak-<sha1>` file in the current directory.
 `make check` replays every file under `regressions/<target>/` too (they live
 alongside the seed corpus), so a fixed bug cannot silently regress.
 
-## Not yet fuzzed
-
-The TNC control-command parser (`process_control_bytes` /
-`execute_control_command` in `data_interfaces/tcp_interfaces.c`) is intentionally
-not covered here: it routes every command through `arq_submit_tcp_cmd()` and reads
-several external ring buffers, so a target needs a stub layer. See the "Roadmap"
-section below.
-
-
 ## Roadmap / future work
 
-- **TNC control-command parser** (`process_control_bytes`): needs a stub layer for
-  `arq_submit_tcp_cmd()`, the ARQ ring buffers, and socket state before it can be a
-  clean target. Worth doing next - it parses attacker-influenced TCP text.
 - **OSS-Fuzz onboarding**: these targets follow the standard libFuzzer entry-point
   shape (`LLVMFuzzerTestOneInput`), so an OSS-Fuzz `project.yaml` + `build.sh` that
   compiles `tests/fuzz/*.c` would give continuous cloud fuzzing for free. Good

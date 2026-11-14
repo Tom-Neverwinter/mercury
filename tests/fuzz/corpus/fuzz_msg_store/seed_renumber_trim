@@ -1,0 +1,5 @@
+{"ts":1,"ms":0,"plane":"arq","dir":"rx","peer":"A","text":"old format, no seq"}
+{"seq":9,"ts":2,"ms":0,"plane":"arq","dir":"rx","peer":"B","text":"x"}
+{"seq":4,"ts":3,"ms":0,"plane":"arq","dir":"rx","peer":"C","text":"out of order"}
+
+{"seq":18446744073709551615,"text":"max"}

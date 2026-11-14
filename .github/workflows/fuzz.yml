@@ -20,7 +20,7 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180   # 12 targets x 600 s, plus the build
     steps:
       - uses: actions/checkout@v4
       - name: Build targets, smoke run, replay saved regressions
