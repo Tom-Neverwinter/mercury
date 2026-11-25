@@ -107,7 +107,9 @@ static pthread_mutex_t modem_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 /* One lock per pool slot, indexed the same way the pool array is.  The pool is
  * a generic slot array now (any backend, not just freedv), so the lock a codec
  * belongs to is found by its context pointer rather than by naming the mode. */
-#define MODEM_POOL_MAX 12
+#define MODEM_POOL_MAX 16   /* the BW2300 ladder, control, floors, the 2.0 BW500/BW2750 rungs and
+                             * MFSK2K: 16, full -- the next mode needs this raised (and a lock
+                             * initializer below), or init_mode_pool_locked fails */
 static pthread_mutex_t modem_inst_lock[MODEM_POOL_MAX] = {
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
@@ -115,7 +117,11 @@ static pthread_mutex_t modem_inst_lock[MODEM_POOL_MAX] = {
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
 };
+_Static_assert(sizeof(modem_inst_lock) / sizeof(modem_inst_lock[0]) == MODEM_POOL_MAX,
+               "one lock per pool slot");
 /* Anything not in the pool (test doubles, a mode opened ad hoc) shares this
  * one: correct, just not parallel. */
 static pthread_mutex_t modem_inst_lock_other = PTHREAD_MUTEX_INITIALIZER;
@@ -166,6 +172,27 @@ void modem_set_tx_gain(float linear)
 float modem_get_tx_gain(void)
 {
     return atomic_load(&g_tx_gain);
+}
+
+/* Host DRIVELEVEL: attenuation, MODEM_DRIVE_MIN_DB..0 dB, on everything the
+ * modem keys -- data frames below the operator's TX gain, the tuning carrier
+ * below the level TUNE set -- so a host can lower the drive but never raise
+ * it past what the operator set.  Not saved: each start is at 0 dB. */
+static _Atomic int   g_drive_milli  = 0;      /* dB * 1000 */
+static _Atomic float g_drive_linear = 1.0f;
+
+int modem_set_drive_db(float db)
+{
+    if (!isfinite(db) || db < MODEM_DRIVE_MIN_DB || db > 0.0f)
+        return -1;
+    atomic_store(&g_drive_milli, (int)lrintf(db * 1000.0f));
+    atomic_store(&g_drive_linear, powf(10.0f, db / 20.0f));
+    return 0;
+}
+
+static float tx_gain_now(void)
+{
+    return atomic_load(&g_tx_gain) * atomic_load(&g_drive_linear);
 }
 
 /* --- TX keying delay (ms), waited after PTT ON before audio is handed to
@@ -221,6 +248,8 @@ float modem_get_tx_peak_dbfs(void)
  * effect within ~one chunk instead of after the whole ring drains. */
 #define MODEM_TUNE_RING_HIGH_BYTES (4800 * (int)sizeof(int32_t))   /* 600 ms */
 
+static void modem_cut_tx(void);   /* ABORT stops the keydown (key_and_play) */
+
 static _Atomic bool     g_tune_active      = false;
 static _Atomic bool     g_tune_stop        = false;
 static _Atomic int      g_tune_dbfs_milli  = -15000;  /* dBFS * 1000 */
@@ -237,6 +266,15 @@ bool modem_tune_active(void)
 float modem_tune_level_dbfs(void)
 {
     return (float)atomic_load(&g_tune_dbfs_milli) / 1000.0f;
+}
+
+/* The level the carrier is generated at: what TUNE set, lowered by the
+ * host's DRIVELEVEL.  tune_thread reads it for every chunk, so a carrier
+ * already on follows a change within ~100 ms. */
+static float modem_tune_effective_dbfs(void)
+{
+    float eff = (float)(atomic_load(&g_tune_dbfs_milli) + atomic_load(&g_drive_milli)) / 1000.0f;
+    return eff < MODEM_TUNE_MIN_DBFS ? MODEM_TUNE_MIN_DBFS : eff;
 }
 
 static void *tune_thread(void *unused)
@@ -266,7 +304,7 @@ static void *tune_thread(void *unused)
             continue;
         }
 
-        float dbfs = modem_tune_level_dbfs();
+        float dbfs = modem_tune_effective_dbfs();
         double amp = pow(10.0, (double)dbfs / 20.0) * 2147483648.0;
         for (int i = 0; i < MODEM_TUNE_CHUNK_SAMPLES; i++)
         {
@@ -362,18 +400,27 @@ void modem_tune_stop(void)
 }
 
 /* Convert a 16-bit modulator sample to a 32-bit playback sample with gain
- * and saturation.  At gain == 1.0 this matches the historical behavior of
- * mapping int16 into the upper bits of int32 — but via a multiply by 65536,
- * not a left shift: shifting a negative int32 is undefined in C.  Saturates
+ * and saturation: int16 into the upper bits of int32, raised by TX_BASE_GAIN,
+ * via a multiply, not a left shift: shifting a negative int32 is undefined
+ * in C.  Saturates
  * against INT32 limits using a >= / <= compare because the literal
  * 2147483647.0f rounds up to 2^31 in float, so a strict > would let the
  * boundary case fall through to an undefined int cast.  *peak_fs, if
  * non-NULL, is raised to the pre-saturation magnitude |fs| so the UI meter
  * reflects the true post-gain level (it can read above full-scale, i.e. the
  * amount of clipping) rather than the clamped sample. */
+/* The modulators leave half the int16 range unused: the OFDM modes clip
+ * their peaks at 16384 (-6 dBFS) and MFSK peaks at -6.5 dBFS.  On a radio
+ * whose power setting is reached only by a full-scale signal (the sBitx
+ * through radiod) that cost a quarter of the power.  4 dB more puts the
+ * peaks at about -2 dBFS: a resampler on the way (radiod's upsampler) was
+ * seen to add 1 dB to an MFSK peak.  tx_gain_db trims around this level;
+ * TUNE does not go through it. */
+#define TX_BASE_GAIN 1.5849f   /* +4 dB */
+
 static inline int32_t tx_sample_with_gain(int16_t sample, float gain, float *peak_fs)
 {
-    float fs = (float)sample * 65536.0f * gain;
+    float fs = (float)sample * (65536.0f * TX_BASE_GAIN) * gain;
     if (peak_fs)
     {
         float mag = fabsf(fs);
@@ -614,8 +661,14 @@ static bool is_supported_split_mode(int mode)
            mode == FREEDV_MODE_DATAC16 ||
            mode == FREEDV_MODE_DATAC17 ||
            mode == FREEDV_MODE_QAM16C2 ||
+           mode == FREEDV_MODE_DATAC17W ||
+           mode == FREEDV_MODE_QAM16C2W ||
+           mode == FREEDV_MODE_DATAN1 ||
+           mode == FREEDV_MODE_QAM16N1 ||
+           mode == FREEDV_MODE_QAM16N2 ||
            mode == MERCURY_MODE_MFSK ||
-           mode == MERCURY_MODE_MFSK_N32;
+           mode == MERCURY_MODE_MFSK_N32 ||
+           mode == MERCURY_MODE_MFSK_W2;
 }
 
 static bool is_payload_split_mode(int mode)
@@ -626,8 +679,14 @@ static bool is_payload_split_mode(int mode)
            mode == FREEDV_MODE_DATAC15 ||
            mode == FREEDV_MODE_DATAC17 ||
            mode == FREEDV_MODE_QAM16C2 ||
+           mode == FREEDV_MODE_DATAC17W ||
+           mode == FREEDV_MODE_QAM16C2W ||
+           mode == FREEDV_MODE_DATAN1 ||
+           mode == FREEDV_MODE_QAM16N1 ||
+           mode == FREEDV_MODE_QAM16N2 ||
            mode == MERCURY_MODE_MFSK ||
-           mode == MERCURY_MODE_MFSK_N32;
+           mode == MERCURY_MODE_MFSK_N32 ||
+           mode == MERCURY_MODE_MFSK_W2;
 }
 
 bool modem_listen_mode_switchable(int mode) { return is_payload_split_mode(mode); }
@@ -678,6 +737,10 @@ static int init_mode_pool_locked(int frames_per_burst, int freedv_verbosity)
         FREEDV_MODE_DATAC4,  FREEDV_MODE_DATAC3,  FREEDV_MODE_DATAC1,
         FREEDV_MODE_DATAC17, FREEDV_MODE_QAM16C2, MERCURY_MODE_MFSK,
         MERCURY_MODE_MFSK_N32,
+        /* the BW2750 and BW500 rungs (car_session_level_mode) */
+        FREEDV_MODE_DATAC17W, FREEDV_MODE_QAM16C2W, FREEDV_MODE_DATAN1,
+        FREEDV_MODE_QAM16N1, FREEDV_MODE_QAM16N2,
+        MERCURY_MODE_MFSK_W2,          /* BW2300/BW2750 rung 1 */
     };
     clear_mode_pool_locked();
     for (size_t i = 0; i < sizeof(pool_modes) / sizeof(pool_modes[0]); i++)
@@ -755,10 +818,22 @@ static uint32_t bitrate_level_from_payload_mode(int mode)
         return 17;
     case FREEDV_MODE_QAM16C2:
         return 25;
+    case FREEDV_MODE_DATAC17W:
+        return 26;
+    case FREEDV_MODE_QAM16C2W:
+        return 27;
+    case FREEDV_MODE_DATAN1:
+        return 28;
+    case FREEDV_MODE_QAM16N1:
+        return 29;
+    case FREEDV_MODE_QAM16N2:
+        return 30;
     case MERCURY_MODE_MFSK:
         return 100;
     case MERCURY_MODE_MFSK_N32:
         return 103;
+    case MERCURY_MODE_MFSK_W2:
+        return 104;
     default:
         return 15;
     }
@@ -1116,9 +1191,19 @@ try_shm_connect2:
     arq_modem_set_crc_seed_fn(modem_apply_crc_seed);
     /* A session's patterns go at its floor's geometry. */
     arq_modem_set_floor_mode_fn(mfsk_pattern_set_geometry);
+    /* ABORT stops the keydown on the air. */
+    arq_modem_set_cut_tx_fn(modem_cut_tx);
     
     int modem_sample_rate = g_modem->codec.be->sample_rate(g_modem->codec.ctx);
-    HLOGI("modem", "Initialized persistent mode pool (DATAC16/DATAC15/DATAC13/DATAC4/DATAC3/DATAC1/DATAC17/QAM16C2/MFSK/MFSK500), frames per burst: %d", frames_per_burst);
+    {
+        /* Each mode by name (the Go harness looks for them), from the pool. */
+        char names[256] = "";
+        for (int i = 0; i < modem_mode_pool_n; i++)
+            snprintf(names + strlen(names), sizeof(names) - strlen(names), "%s%s",
+                     i ? "/" : "", mode_name_from_enum(modem_mode_pool[i].mode));
+        HLOGI("modem", "Initialized persistent mode pool (%d modes: %s), frames per burst: %d",
+              modem_mode_pool_n, names, frames_per_burst);
+    }
     HLOGI("modem", "Active FreeDV mode at startup: %d (%s), verbosity: %d", mode, mode_name_from_enum(mode), freedv_verbosity);
     HLOGI("modem", "Modem expects sample rate: %d Hz", modem_sample_rate);
     HLOGI("modem", "Modem payload bytes per frame: %zu", payload_bytes_per_modem_frame);
@@ -1385,6 +1470,52 @@ static void append_burst_audio(const modem_codec_t *codec, const uint8_t *bytes_
 
 /* Key the transmitter, play `total_samples` of pre-built audio, unkey.  ARQ's
  * TX_STARTED reports the modem's current mode, so set that first. */
+/* ABORT cuts what the TX worker took before it (arq_modem_cut_tx).  Each cut
+ * moves g_tx_cut_gen on; the worker notes the count as it takes each action
+ * off the queue (g_tx_taken_gen, its thread only), and what it took before a
+ * cut is cut -- on the air, or not keyed at all if the cut came while it was
+ * still being built (#592 review: a keydown taken, not yet keyed, played its
+ * whole 27 s).  The ABORT's own DISCONNECT is queued after the cut, so it is
+ * taken at the new count and plays out whole. */
+static _Atomic unsigned g_tx_cut_gen = 0;
+static unsigned         g_tx_taken_gen = 0;
+/* Only the TX worker's transmissions are cut: another caller of key_and_play
+ * (run_tests_tx, -t) never takes an action, and its count would be stale. */
+static pthread_t        g_tx_worker;
+static _Atomic bool     g_tx_worker_known = false;
+
+static void modem_cut_tx(void)
+{
+    atomic_fetch_add(&g_tx_cut_gen, 1);
+}
+
+/* The TX worker, as it takes an action (or none) off the queue. */
+static void tx_note_taken(void)
+{
+    if (!atomic_load(&g_tx_worker_known))
+    {
+        g_tx_worker = pthread_self();
+        atomic_store(&g_tx_worker_known, true);
+    }
+    g_tx_taken_gen = atomic_load(&g_tx_cut_gen);
+}
+
+static bool tx_cut_asked(void)
+{
+    return atomic_load(&g_tx_worker_known) && pthread_equal(pthread_self(), g_tx_worker) &&
+           atomic_load(&g_tx_cut_gen) != g_tx_taken_gen;
+}
+
+/* The cut, if one was asked for: the audio not yet played is dropped, so the
+ * radio carries the playback device's own buffer at most before PTT drops. */
+static bool tx_cut_now(void)
+{
+    if (!tx_cut_asked())
+        return false;
+    clear_buffer(playback_buffer);
+    return true;
+}
+
 static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t total_samples,
                          float peak_fs)
 {
@@ -1409,6 +1540,13 @@ static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t to
 
     /* === STEP 2: Key transmitter and send pre-generated audio === */
 
+    if (tx_cut_asked())
+    {
+        /* Cut before it keyed: the carousel still waits for its end. */
+        HLOGI("modem-tx", "keydown dropped before keying (ABORT)");
+        arq_modem_ptt_off();
+        return;
+    }
     ptt_on();
     arq_modem_ptt_on(g_modem->mode, g_modem->payload_bytes_per_modem_frame + 2);
 
@@ -1434,6 +1572,11 @@ static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t to
                (size_buffer(playback_buffer) > 0 ||
                 time_now_ms() < t0_ms + burst_ms + tail_ms))
         {
+            if (tx_cut_now())
+            {
+                HLOGI("modem-tx", "keydown cut short (ABORT)");
+                break;
+            }
             uint64_t now = time_now_ms();
             if (now >= next_spec_ms)
             {
@@ -1479,6 +1622,13 @@ static void key_and_play(generic_modem_t *g_modem, int32_t *tx_buffer, size_t to
          * on a HERMES SHM station the radio daemon holds it there. */
         while (waited_us < playback_duration_us && !mercury_stop)
         {
+            if (tx_cut_now())
+            {
+                HLOGI("modem-tx", "keydown cut short (ABORT) %llu of %llu ms in",
+                      (unsigned long long)(waited_us / 1000ULL),
+                      (unsigned long long)(playback_duration_us / 1000ULL));
+                break;
+            }
             size_t pos = (size_t)((waited_us * FREEDV_FS_8000) / 1000000ULL);
             publish_tx_spectrum_at(tx_buffer, total_samples, pos, FREEDV_FS_8000);
 
@@ -1561,7 +1711,7 @@ int send_modulated_data(generic_modem_t *g_modem, uint8_t *bytes_in, int frames_
     }
 
     size_t total_samples = 0;
-    float tx_gain = atomic_load(&g_tx_gain);
+    float tx_gain = tx_gain_now();
     float peak_fs = 0.0f;  /* pre-saturation peak magnitude across this burst */
 
     for (int i = 0; i < samples_head; i++)
@@ -1647,7 +1797,7 @@ static int send_modulated_keydown(generic_modem_t *g_modem, const arq_keydown_t 
     }
 
     size_t total = 0;
-    float tx_gain = atomic_load(&g_tx_gain);
+    float tx_gain = tx_gain_now();
     float peak_fs = 0.0f;
     for (int i = 0; i < FREEDV_FS_8000 * TX_HEAD_SILENCE_MS / 1000; i++)
         tx_buffer[total++] = 0;
@@ -1775,7 +1925,7 @@ static int send_pattern_ack(generic_modem_t *g_modem, int mode, int pattern_kind
     }
 
     size_t k = 0;
-    float tx_gain = atomic_load(&g_tx_gain);
+    float tx_gain = tx_gain_now();
     float peak_fs = 0.0f;
     for (int i = 0; i < samples_head; i++) tx_buffer[k++] = 0;
     /* MFSK generator emits int16 passband; scale up to int32 with tx_gain. */
@@ -2211,7 +2361,7 @@ static void process_received_frame(const uint8_t *data,
     case PACKET_TYPE_ARQ_CALL:    /* 1.9.x: logged if it is for us, not answered */
     case PACKET_TYPE_ARQ_CALL2:
         if (arq_policy_ready)
-            arq_handle_incoming_connect_frame((uint8_t *)data, payload_nbytes, snr_est, mode);
+            arq_handle_incoming_connect_frame((uint8_t *)data, payload_nbytes, snr_est, mode, age_ms);
         break;
     case PACKET_TYPE_ARQ_CQ:
         if (arq_policy_ready)
@@ -2397,6 +2547,18 @@ static void rx_inflight_note(int slot, int mode, const rx_metrics_accum_t *m, ui
         atomic_store(&g_rx_inflight_since_ms[slot], 0);
 }
 
+/* A slot locked onto a frame that can hold a scanning host: any but the
+ * 500 Hz MFSK, whichever slot it sits in (the listen floor at BW500, the
+ * second listener above it).  Its carrier sense held a false lock for a whole
+ * 27 s frame twice in 9 minutes on the real 40 m band (7050 kHz), where the
+ * control plane and the 1 kHz MFSK held none; a CALL on it gets its PENDING
+ * when it decodes. */
+static bool rx_inflight_call(int slot)
+{
+    return atomic_load(&g_rx_inflight_since_ms[slot]) != 0 &&
+           atomic_load(&g_rx_inflight_mode[slot]) != MERCURY_MODE_MFSK_N32;
+}
+
 bool modem_rx_frame_in_flight(const char **mode_name, uint64_t *for_ms)
 {
     uint64_t now = monotonic_ms();
@@ -2429,6 +2591,18 @@ static int rx_decoder_bind_own(rx_decoder_state_t *state, modem_codec_t codec, i
     size_t bytes_cap = (size_t)(codec.be->bits_per_frame(codec.ctx) / 8);
     if (max_samples <= 0 || bytes_cap == 0)
         return -1;
+    /* The codec left behind keeps what it holds until this worker binds it
+     * again: an MFSK listener swapping floors at a BW change would come back
+     * to the other floor's half-heard CALL.  Drop it now, whichever of the
+     * swap's flush and this bind runs first. */
+    if (modem_codec_valid(&state->codec) && state->codec.ctx != codec.ctx &&
+        state->codec.be->unsync)
+    {
+        pthread_mutex_t *rl = modem_inst_lock_for(state->codec.ctx);
+        pthread_mutex_lock(rl);
+        state->codec.be->unsync(state->codec.ctx);
+        pthread_mutex_unlock(rl);
+    }
     state->demod_count = 0;
     return rx_decoder_adopt(state, codec, mode, max_samples, bytes_cap);
 }
@@ -2490,7 +2664,11 @@ static void *rx_worker_thread(void *arg)
         if (w->takes_payload_resync &&
             atomic_exchange(&g_payload_resync_req, false))
         {
-            if (modem_codec_valid(&w->state.codec) && w->state.codec.be->unsync)
+            /* Not an MFSK payload decoder: it has no trial sync on DATAC16
+             * to drop, and its window holds whole bursts, so an UNSYNC here
+             * could lose a payload frame already in it. */
+            if (modem_codec_valid(&w->state.codec) && w->state.codec.be->unsync &&
+                !mercury_mode_is_mfsk(w->state.mode))
             {
                 pthread_mutex_t *rl = modem_inst_lock_for(w->state.codec.ctx);
                 pthread_mutex_lock(rl);
@@ -2851,6 +3029,9 @@ void *tx_thread(void *g_modem)
             waited_for_action = true;
             have_action = arq_wait_dequeue_action(&action, ARQ_ACTION_WAIT_MS);
         }
+        /* After the wait, not before it: a DISCONNECT queued behind an ABORT
+         * that came during the wait is taken at the ABORT's count. */
+        tx_note_taken();
 
         if (have_action && action.type == ARQ_ACTION_TX_PATTERN)
         {
@@ -3573,6 +3754,10 @@ void *rx_thread(void *g_modem)
             rx_inflight_note(RX_INFLIGHT_LISTEN, atomic_load(&w_listen.mode), &m_listen, now);
             rx_inflight_note(RX_INFLIGHT_LISTEN_ALT, atomic_load(&w_listen_alt.mode),
                              &m_listen_alt, now);
+            if (arq_policy_ready && (rx_inflight_call(RX_INFLIGHT_CTRL) ||
+                                     rx_inflight_call(RX_INFLIGHT_LISTEN) ||
+                                     rx_inflight_call(RX_INFLIGHT_LISTEN_ALT)))
+                arq_note_call_in_flight();   /* a scanning host is held (#527) */
         }
         {
             /* The monitor decoders are also not a link-quality source: their
